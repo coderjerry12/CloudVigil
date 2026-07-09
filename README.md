@@ -1,6 +1,6 @@
 # CloudVigil 🛡️
 
-**Create. Monitor. Protect. Respond.** — Powered by Amazon Bedrock AI.
+**AI-powered Serverless Event Management & Safety Platform on AWS
 
 ## 🌟 Overview
 
