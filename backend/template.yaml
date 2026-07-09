@@ -1,0 +1,1342 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: EventShield AI - Event Management Backend (Phase 3)
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  CognitoUserPoolId:
+    Type: String
+    Description: Cognito User Pool ID for JWT authorization
+  CognitoUserPoolArn:
+    Type: String
+    Description: Cognito User Pool ARN for API Gateway authorizer
+
+Globals:
+  Function:
+    Runtime: nodejs18.x
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        EVENTS_TABLE: !Ref EventsTable
+        REGISTRATIONS_TABLE: !Ref RegistrationsTable
+        INCIDENTS_TABLE: !Ref IncidentsTable
+        NOTIFICATIONS_TABLE: !Ref NotificationsTable
+        CHAT_HISTORY_TABLE: !Ref ChatHistoryTable
+        FEEDBACK_TABLE: !Ref FeedbackTable
+        EVENT_IMAGES_BUCKET: !Ref EventImagesBucket
+        IMAGES_CDN_DOMAIN: !GetAtt ImagesCDN.DomainName
+        BEDROCK_MODEL_ID: anthropic.claude-3-haiku-20240307-v1:0
+        ENVIRONMENT: !Ref Environment
+    Architectures:
+      - arm64
+    Tags:
+      Project: EventShield-AI
+      auto-delete: "no"
+
+Resources:
+  # ============================================
+  # DynamoDB Table
+  # ============================================
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub EventShield-Events-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: organizerId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: eventDate
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: organizerId-index
+          KeySchema:
+            - AttributeName: organizerId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-eventDate-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: eventDate
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: EventShield-AI
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: auto-delete
+          Value: "no"
+
+  # ============================================
+  # S3 Bucket for Event Images
+  # ============================================
+  EventImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub eventshield-event-images-${Environment}-${AWS::AccountId}
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT]
+            AllowedOrigins: ['*']
+            MaxAge: 3600
+      Tags:
+        - Key: Project
+          Value: EventShield-AI
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudFront for serving event images permanently (no pre-signed URL expiry)
+  ImagesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EventImagesBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontImages
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${EventImagesBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${ImagesCDN}'
+
+  ImagesCDNOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub EventShield-Images-OAC-${Environment}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  ImagesCDN:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub EventShield Event Images CDN - ${Environment}
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: S3ImagesOrigin
+            DomainName: !GetAtt EventImagesBucket.RegionalDomainName
+            OriginAccessControlId: !Ref ImagesCDNOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3ImagesOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+      Tags:
+        - Key: Project
+          Value: EventShield-AI
+
+  # ============================================
+  # AI Description Suggestion Lambda
+  # ============================================
+  SuggestDescriptionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-SuggestDescription-${Environment}
+      Handler: handlers/suggestDescription.handler
+      CodeUri: src/
+      Timeout: 30
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: '*'
+      Events:
+        SuggestDescription:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /suggest-description
+            Method: POST
+
+  # ============================================
+  # Image Upload Pre-signed URL Lambda
+  # ============================================
+  GetUploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetUploadUrl-${Environment}
+      Handler: handlers/getUploadUrl.handler
+      CodeUri: src/
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref EventImagesBucket
+      Events:
+        GetUploadUrl:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /upload-url
+            Method: POST
+
+  # ============================================
+  # API Gateway
+  # ============================================
+  EventShieldApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub EventShield-API-${Environment}
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !Ref CognitoUserPoolArn
+            Identity:
+              Header: Authorization
+
+  # ============================================
+  # Lambda Functions
+  # ============================================
+  CreateEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-CreateEvent-${Environment}
+      Handler: handlers/createEvent.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+      Events:
+        CreateEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /events
+            Method: POST
+
+  GetEventsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetEvents-${Environment}
+      Handler: handlers/getEvents.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+      Events:
+        GetEvents:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /events
+            Method: GET
+
+  GetEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetEvent-${Environment}
+      Handler: handlers/getEvent.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+      Events:
+        GetEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /events/{eventId}
+            Method: GET
+
+  UpdateEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-UpdateEvent-${Environment}
+      Handler: handlers/updateEvent.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+      Events:
+        UpdateEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /events/{eventId}
+            Method: PUT
+
+  DeleteEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-DeleteEvent-${Environment}
+      Handler: handlers/deleteEvent.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+      Events:
+        DeleteEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /events/{eventId}
+            Method: DELETE
+
+  # ============================================
+  # Phase 4: Registration Table
+  # ============================================
+  RegistrationsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub EventShield-Registrations-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: attendeeId
+          AttributeType: S
+        - AttributeName: registeredAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+        - AttributeName: attendeeId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: attendeeId-index
+          KeySchema:
+            - AttributeName: attendeeId
+              KeyType: HASH
+            - AttributeName: registeredAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: EventShield-AI
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: auto-delete
+          Value: "no"
+
+  # ============================================
+  # Phase 4: Registration Lambda Functions
+  # ============================================
+  RegisterForEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-RegisterForEvent-${Environment}
+      Handler: handlers/registerForEvent.handler
+      CodeUri: src/
+      Environment:
+        Variables:
+          SES_SENDER_EMAIL: anupriyamishra1221@gmail.com
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: '*'
+      Events:
+        Register:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /registrations
+            Method: POST
+
+  GetMyRegistrationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetMyRegistrations-${Environment}
+      Handler: handlers/getMyRegistrations.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+      Events:
+        GetMyRegistrations:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /registrations/my
+            Method: GET
+
+  CancelRegistrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-CancelRegistration-${Environment}
+      Handler: handlers/cancelRegistration.handler
+      CodeUri: src/
+      Environment:
+        Variables:
+          SES_SENDER_EMAIL: anupriyamishra1221@gmail.com
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: '*'
+      Events:
+        CancelRegistration:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /registrations/cancel/{eventId}
+            Method: POST
+
+  GetRegistrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetRegistration-${Environment}
+      Handler: handlers/getRegistration.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+      Events:
+        GetRegistration:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /registrations/{registrationId}
+            Method: GET
+
+  GetEventRegistrationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetEventRegistrations-${Environment}
+      Handler: handlers/getEventRegistrations.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+      Events:
+        GetEventRegistrations:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /events/{eventId}/registrations
+            Method: GET
+
+  # ============================================
+  # Phase 5: Check-In & Attendance Lambda Functions
+  # ============================================
+  ProcessCheckinFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-ProcessCheckin-${Environment}
+      Handler: handlers/processCheckin.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+      Events:
+        ProcessCheckin:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /attendance/checkin
+            Method: POST
+
+  GetEventAttendanceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetEventAttendance-${Environment}
+      Handler: handlers/getEventAttendance.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+      Events:
+        GetEventAttendance:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /events/{eventId}/attendance
+            Method: GET
+
+  GetMyAttendanceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetMyAttendance-${Environment}
+      Handler: handlers/getMyAttendance.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+      Events:
+        GetMyAttendance:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /attendance/my
+            Method: GET
+
+  # ============================================
+  # Phase 6: Incidents Table
+  # ============================================
+  IncidentsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub EventShield-Incidents-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: incidentId
+          AttributeType: S
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: attendeeId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: priority
+          AttributeType: S
+      KeySchema:
+        - AttributeName: incidentId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: eventId-index
+          KeySchema:
+            - AttributeName: eventId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: attendeeId-index
+          KeySchema:
+            - AttributeName: attendeeId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-priority-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: priority
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: EventShield-AI
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: auto-delete
+          Value: "no"
+
+  # ============================================
+  # Phase 6: Safety Lambda Functions
+  # ============================================
+  CreateIncidentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-CreateIncident-${Environment}
+      Handler: handlers/createIncident.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+      Events:
+        CreateIncident:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /incidents
+            Method: POST
+
+  GetMyIncidentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetMyIncidents-${Environment}
+      Handler: handlers/getMyIncidents.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentsTable
+      Events:
+        GetMyIncidents:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /incidents/my
+            Method: GET
+
+  GetAllOrganizerIncidentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetAllOrganizerIncidents-${Environment}
+      Handler: handlers/getAllOrganizerIncidents.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+      Events:
+        GetAllOrganizerIncidents:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /incidents/organizer
+            Method: GET
+
+  GetEventIncidentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetEventIncidents-${Environment}
+      Handler: handlers/getEventIncidents.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+      Events:
+        GetEventIncidents:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /events/{eventId}/incidents
+            Method: GET
+
+  UpdateIncidentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-UpdateIncident-${Environment}
+      Handler: handlers/updateIncident.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+      Events:
+        UpdateIncident:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /incidents/{incidentId}
+            Method: PATCH
+
+  # ============================================
+  # Phase 6B: Escalation Lambda + EventBridge
+  # ============================================
+  EscalateIncidentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-EscalateIncidents-${Environment}
+      Handler: handlers/escalateIncidents.handler
+      CodeUri: src/
+      Timeout: 60
+      Environment:
+        Variables:
+          SES_SENDER_EMAIL: anupriyamishra1221@gmail.com
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: '*'
+      Events:
+        EscalationSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Description: Escalate unresolved safety incidents
+            Enabled: true
+
+  # ============================================
+  # Phase 6D: Crowd Monitoring Lambda + EventBridge
+  # ============================================
+  MonitorCrowdsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-MonitorCrowds-${Environment}
+      Handler: handlers/monitorCrowds.handler
+      CodeUri: src/
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+      Events:
+        CrowdSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Description: Monitor crowd density for active events
+            Enabled: true
+
+  # ============================================
+  # Auto-Complete Events Lambda + Schedule
+  # ============================================
+  AutoCompleteEventsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-AutoCompleteEvents-${Environment}
+      Handler: handlers/autoCompleteEvents.handler
+      CodeUri: src/
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+      Events:
+        AutoCompleteSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(30 minutes)
+            Description: Auto-mark past events as COMPLETED
+            Enabled: true
+
+  # ============================================
+  # Phase 7: Notifications Table
+  # ============================================
+  NotificationsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub EventShield-Notifications-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: recipientId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: recipientId
+          KeyType: HASH
+        - AttributeName: createdAt
+          KeyType: RANGE
+      Tags:
+        - Key: Project
+          Value: EventShield-AI
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: auto-delete
+          Value: "no"
+
+  # ============================================
+  # Phase 7: Notification Lambda Functions
+  # ============================================
+  GetMyNotificationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetMyNotifications-${Environment}
+      Handler: handlers/getMyNotifications.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+      Events:
+        GetMyNotifications:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /notifications/my
+            Method: GET
+
+  MarkNotificationReadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-MarkNotificationRead-${Environment}
+      Handler: handlers/markNotificationRead.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+      Events:
+        MarkNotificationRead:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /notifications/{notificationId}/read
+            Method: PATCH
+
+  MarkAllNotificationsReadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-MarkAllNotificationsRead-${Environment}
+      Handler: handlers/markAllNotificationsRead.handler
+      CodeUri: src/
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+      Events:
+        MarkAllRead:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /notifications/read-all
+            Method: POST
+
+  GetUnreadCountFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetUnreadCount-${Environment}
+      Handler: handlers/getUnreadCount.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+      Events:
+        GetUnreadCount:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /notifications/unread-count
+            Method: GET
+
+  # ============================================
+  # Phase 7: Event Reminder Lambda + Schedule
+  # ============================================
+  SendRemindersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-SendReminders-${Environment}
+      Handler: handlers/sendReminders.handler
+      CodeUri: src/
+      Timeout: 120
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+      Events:
+        ReminderSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(30 minutes)
+            Description: Send 24h and 1h event reminders
+            Enabled: true
+
+  # ============================================
+  # Phase 8: Chat History Table
+  # ============================================
+  ChatHistoryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub EventShield-ChatHistory-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: createdAt
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: EventShield-AI
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: auto-delete
+          Value: "no"
+
+  # ============================================
+  # Phase 8: AI Chat Lambda Functions
+  # ============================================
+  ChatFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-Chat-${Environment}
+      Handler: handlers/chat.handler
+      CodeUri: src/
+      Timeout: 60
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ChatHistoryTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: '*'
+      Events:
+        Chat:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /chat
+            Method: POST
+
+  GetChatHistoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetChatHistory-${Environment}
+      Handler: handlers/getChatHistory.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ChatHistoryTable
+      Events:
+        GetChatHistory:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /chat/history
+            Method: GET
+
+  # ============================================
+  # Phase 9: Recommendations Lambda
+  # ============================================
+  GetRecommendationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetRecommendations-${Environment}
+      Handler: handlers/getRecommendations.handler
+      CodeUri: src/
+      Timeout: 30
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+      Events:
+        GetRecommendations:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /recommendations
+            Method: GET
+
+  TrackRecommendationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-TrackRecommendation-${Environment}
+      Handler: handlers/trackRecommendation.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+      Events:
+        TrackRecommendation:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /recommendations/track
+            Method: POST
+
+  # ============================================
+  # Phase 10: Analytics Lambda
+  # ============================================
+  GetAnalyticsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetAnalytics-${Environment}
+      Handler: handlers/getAnalytics.handler
+      CodeUri: src/
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+      Events:
+        GetAnalytics:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /analytics
+            Method: GET
+
+  # ============================================
+  # Phase 12: Feedback Table
+  # ============================================
+  FeedbackTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub EventShield-Feedback-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: attendeeId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+        - AttributeName: attendeeId
+          KeyType: RANGE
+      Tags:
+        - Key: Project
+          Value: EventShield-AI
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: auto-delete
+          Value: "no"
+
+  # ============================================
+  # Phase 12: Feedback Lambda Functions
+  # ============================================
+  SubmitFeedbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-SubmitFeedback-${Environment}
+      Handler: handlers/submitFeedback.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FeedbackTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+      Events:
+        SubmitFeedback:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /feedback
+            Method: POST
+
+  GetEventFeedbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetEventFeedback-${Environment}
+      Handler: handlers/getEventFeedback.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FeedbackTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+      Events:
+        GetEventFeedback:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /events/{eventId}/feedback
+            Method: GET
+
+  GetMyFeedbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EventShield-GetMyFeedback-${Environment}
+      Handler: handlers/getMyFeedback.handler
+      CodeUri: src/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FeedbackTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+      Events:
+        GetMyFeedback:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventShieldApi
+            Path: /feedback/my
+            Method: GET
+
+  # ============================================
+  # WAF: Rate Limiting & Bot Protection
+  # ============================================
+  ApiWafWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub EventShield-API-WAF-${Environment}
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      Description: Rate limiting and bot protection for EventShield API
+      Rules:
+        - Name: RateLimitPerIP
+          Priority: 1
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 300
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitPerIP
+        - Name: RegistrationRateLimit
+          Priority: 2
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 10
+              AggregateKeyType: IP
+              ScopeDownStatement:
+                ByteMatchStatement:
+                  SearchString: /registrations
+                  FieldToMatch:
+                    UriPath: {}
+                  TextTransformations:
+                    - Priority: 0
+                      Type: NONE
+                  PositionalConstraint: STARTS_WITH
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RegistrationRateLimit
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: EventShieldAPIWAF
+      Tags:
+        - Key: Project
+          Value: EventShield-AI
+
+  ApiWafAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Sub arn:aws:apigateway:${AWS::Region}::/restapis/${EventShieldApi}/stages/${Environment}
+      WebACLArn: !GetAtt ApiWafWebACL.Arn
+
+  # ============================================
+  # CloudWatch Alarm: Escalation Lambda Failures
+  # ============================================
+  EscalationLambdaAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub EventShield-EscalationFailures-${Environment}
+      AlarmDescription: Alarm if the escalation Lambda fails — incidents may go unnoticed
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EscalateIncidentsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # ============================================
+  # Frontend Hosting: S3 + CloudFront
+  # ============================================
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub eventshield-frontend-${Environment}-${AWS::AccountId}
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      Tags:
+        - Key: Project
+          Value: EventShield-AI
+        - Key: Environment
+          Value: !Ref Environment
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontAccess
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub EventShield-OAC-${Environment}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub EventShield AI Frontend - ${Environment}
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+      Tags:
+        - Key: Project
+          Value: EventShield-AI
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${EventShieldApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+  EventsTableName:
+    Description: DynamoDB Events table name
+    Value: !Ref EventsTable
+  EventsTableArn:
+    Description: DynamoDB Events table ARN
+    Value: !GetAtt EventsTable.Arn
+  RegistrationsTableName:
+    Description: DynamoDB Registrations table name
+    Value: !Ref RegistrationsTable
+  RegistrationsTableArn:
+    Description: DynamoDB Registrations table ARN
+    Value: !GetAtt RegistrationsTable.Arn
+  IncidentsTableName:
+    Description: DynamoDB Incidents table name
+    Value: !Ref IncidentsTable
+  IncidentsTableArn:
+    Description: DynamoDB Incidents table ARN
+    Value: !GetAtt IncidentsTable.Arn
+  NotificationsTableName:
+    Description: DynamoDB Notifications table name
+    Value: !Ref NotificationsTable
+  NotificationsTableArn:
+    Description: DynamoDB Notifications table ARN
+    Value: !GetAtt NotificationsTable.Arn
+  EventImagesBucketName:
+    Description: S3 bucket for event images
+    Value: !Ref EventImagesBucket
+  EventImagesBucketUrl:
+    Description: S3 bucket URL for event images
+    Value: !Sub https://${EventImagesBucket}.s3.${AWS::Region}.amazonaws.com
+  ImagesCDNUrl:
+    Description: CloudFront URL for event images (permanent, no expiry)
+    Value: !Sub https://${ImagesCDN.DomainName}
+  FrontendBucketName:
+    Description: S3 bucket for frontend hosting
+    Value: !Ref FrontendBucket
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref CloudFrontDistribution
+  CloudFrontUrl:
+    Description: CloudFront URL for the frontend
+    Value: !Sub https://${CloudFrontDistribution.DomainName}

@@ -1,0 +1,16 @@
+{
+  "name": "eventshield-ai-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "EventShield AI Lambda functions",
+  "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.600.0",
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-s3": "^3.1075.0",
+    "@aws-sdk/client-ses": "^3.600.0",
+    "@aws-sdk/lib-dynamodb": "^3.600.0",
+    "@aws-sdk/s3-request-presigner": "^3.1075.0",
+    "qrcode": "^1.5.3",
+    "uuid": "^10.0.0"
+  }
+}

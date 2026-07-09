@@ -1,0 +1,20 @@
+# SAM CLI Configuration
+# Run: sam deploy --guided for first-time setup
+
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "eventshield-ai-backend-dev"
+resolve_s3 = true
+s3_prefix = "eventshield-ai-backend-dev"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+parameter_overrides = "Environment=\"dev\" CognitoUserPoolId=\"us-east-1_3eGyNCWk4\" CognitoUserPoolArn=\"arn:aws:cognito-idp:us-east-1:884028226738:userpool/us-east-1_3eGyNCWk4\""
+image_repositories = []
+
+[default.build.parameters]
+use_container = false
+
+[default.global.parameters]
+region = "us-east-1"
