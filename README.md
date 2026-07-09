@@ -292,12 +292,7 @@ vs. Traditional (EC2 + RDS): **$200-500/month** → **97% cost reduction**
 |---|---------|-------------|
 | 1 | **IoT Crowd Sensors** | CCTV + Bluetooth beacons for real-time heatmaps |
 | 2 | **Predictive Analytics** | ML crowd surge forecasting with SageMaker |
-| 3 | **Push Notifications** | Firebase Cloud Messaging / SNS for mobile alerts |
-| 4 | **Payment Integration** | Razorpay/Stripe for paid ticket events |
-| 5 | **Native Mobile App** | React Native + offline QR scanning |
-| 6 | **Multi-Tenant** | White-label platform for enterprise customers |
-| 7 | **Emergency SOS to Authorities** | SNS SMS with GPS to local emergency services |
-| 8 | **CI/CD Pipeline** | SAM Pipelines with staged deployment + auto-rollback |
+| 3 | **Native Mobile App** | React Native + offline QR scanning |
 
 ---
 
