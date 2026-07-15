@@ -304,3 +304,5 @@ vs. Traditional (EC2 + RDS): **$200-500/month** → **97% cost reduction**
 ## 📝 License
 
 Built with ☕ & 🎵 by **Anupriya Mishra**
+AWS Amazon 2026 Internship Project
+Mentored by ArulBalaji and Abhishek
