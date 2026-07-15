@@ -1,6 +1,6 @@
 # CloudVigil 🛡️
 
-AI-powered Serverless Event Management & Safety Platform on AWS
+## AI-powered Serverless Event Management & Safety Platform on AWS
 
 ## 🌟 Overview
 
