@@ -19,11 +19,13 @@ It bridges the gap between event management and event safety through:
 
 ## 🚀 Live Demo
 
+[![Demo Video](https://img.shields.io/badge/🎥_DEMO_VIDEO-red?style=for-the-badge)](https://drive.google.com/file/d/1l8irtVUu-MIx9L1ZQGNdhYlEH0cofiPI/view?usp=sharing)
 [![Presentation](https://img.shields.io/badge/📊_PRESENTATION-VIEW_SLIDES-orange?style=for-the-badge)](https://docs.google.com/presentation/d/1CENYEN-CNkKsjyuPsvsWeGPSz4gyCs0n/edit?usp=sharing)
 [![Documentation](https://img.shields.io/badge/📄_DOCUMENTATION-VIEW_DOC-green?style=for-the-badge)](https://docs.google.com/document/d/1YyGra87o2nYSxbW5cCeW5jGUN0DMreGe/edit?usp=sharing)
 
 | | URL |
 |---|---|
+| 🎥 **Demo Video** | [Watch Demo](https://drive.google.com/file/d/1l8irtVUu-MIx9L1ZQGNdhYlEH0cofiPI/view?usp=sharing) |
 | 📊 **Presentation** | [View Slides](https://docs.google.com/presentation/d/1CENYEN-CNkKsjyuPsvsWeGPSz4gyCs0n/edit?usp=sharing) |
 | 📄 **Documentation** | [View Doc](https://docs.google.com/document/d/1YyGra87o2nYSxbW5cCeW5jGUN0DMreGe/edit?usp=sharing) |
 
