@@ -19,13 +19,11 @@ It bridges the gap between event management and event safety through:
 
 ## 🚀 Live Demo
 
-[![GitHub](https://img.shields.io/badge/📦_GITHUB-VIEW_CODE-black?style=for-the-badge&logo=github)](https://github.com/coderjerry12/CloudVigil)
 [![Presentation](https://img.shields.io/badge/📊_PRESENTATION-VIEW_SLIDES-orange?style=for-the-badge)](https://docs.google.com/presentation/d/1CENYEN-CNkKsjyuPsvsWeGPSz4gyCs0n/edit?usp=sharing)
 [![Documentation](https://img.shields.io/badge/📄_DOCUMENTATION-VIEW_DOC-green?style=for-the-badge)](https://docs.google.com/document/d/1YyGra87o2nYSxbW5cCeW5jGUN0DMreGe/edit?usp=sharing)
 
 | | URL |
 |---|---|
-| 📦 **GitHub** | [https://github.com/coderjerry12/CloudVigil](https://github.com/coderjerry12/CloudVigil) |
 | 📊 **Presentation** | [View Slides](https://docs.google.com/presentation/d/1CENYEN-CNkKsjyuPsvsWeGPSz4gyCs0n/edit?usp=sharing) |
 | 📄 **Documentation** | [View Doc](https://docs.google.com/document/d/1YyGra87o2nYSxbW5cCeW5jGUN0DMreGe/edit?usp=sharing) |
 
