@@ -234,8 +234,8 @@ cd frontend && ./deploy.sh
 
 | Role | Email | Password |
 |------|-------|----------|
-| 🏛️ Organizer | mishraap2006@gmail.com | (your password) |
-| 👤 Attendee | anupriyamishra1221@gmail.com | (your password) |
+| 🏛️ Organizer | mishraap2006@gmail.com | Test@1234 |
+| 👤 Attendee | anupriyamishra1221@gmail.com | Test@1221 |
 
 ---
 
